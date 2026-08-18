@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>그늘길 찾기 - 동적 도로 그래프 데모</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div>
+      <h1>그늘길 찾기</h1>
+      <p>여름철 시간대 · 동적 도로 그래프 · 다익스트라 시각화</p>
+    </div>
+    <span class="badge">가상 고밀도 도시 데모</span>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <section>
+        <div class="section-title"><span>01</span><h2>시간대</h2></div>
+        <div class="range-row">
+          <input id="timeRange" type="range" min="11" max="18" value="14" step="1">
+          <b id="timeLabel">14:00</b>
+        </div>
+        <div class="info-box">
+          <span>여름철 맑은 날 기준</span>
+          <b id="sunState">남서쪽 · 태양 고도 높음</b>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-title"><span>02</span><h2>출발 · 도착</h2></div>
+        <div class="two-buttons">
+          <button id="startBtn" class="choice active"><i class="dot start"></i>출발점</button>
+          <button id="endBtn" class="choice"><i class="dot end"></i>도착점</button>
+        </div>
+        <div class="point-summary">
+          <div><span>출발</span><b id="startInfo">도로 위 아무 곳 클릭</b></div>
+          <div><span>도착</span><b id="endInfo">도로 위 아무 곳 클릭</b></div>
+        </div>
+        <button id="runBtn" class="primary" disabled>최단거리 + 그늘우선 계산</button>
+        <button id="resetBtn" class="secondary">초기화</button>
+      </section>
+
+      <section>
+        <div class="section-title"><span>03</span><h2>경로 표시</h2></div>
+        <div class="route-tabs">
+          <button class="route-tab active" data-view="both">함께 보기</button>
+          <button class="route-tab" data-view="short">최단거리</button>
+          <button class="route-tab" data-view="shade">그늘우선</button>
+        </div>
+        <div class="legend-list">
+          <span><i class="legend-line short"></i>거리 가중치</span>
+          <span><i class="legend-line shade"></i>일사 노출 가중치</span>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-title"><span>04</span><h2>다익스트라 확인</h2></div>
+        <label class="check"><input id="showGraph" type="checkbox"> 교차점 노드 표시</label>
+        <label class="check"><input id="showRouteWeights" type="checkbox" checked> 선택 경로 간선 가중치 표시</label>
+        <div class="two-buttons">
+          <button id="animateShort" class="secondary" disabled>최단 재생</button>
+          <button id="animateShade" class="secondary" disabled>그늘 재생</button>
+        </div>
+        <div id="algoStatus" class="algo-status" aria-live="polite">
+          도로 위 아무 위치나 출발점과 도착점으로 선택하세요.
+        </div>
+        <p class="help">
+          출발·도착 노드는 미리 정해져 있지 않습니다. 클릭 지점을 가장 가까운 도로에 투영한 뒤 그 순간 임시 노드를 만들고, 기존 도로 간선을 분할합니다.
+        </p>
+      </section>
+    </aside>
+
+    <section class="content">
+      <div class="map-head">
+        <div>
+          <b>가상 도심 보행 지도</b>
+          <span>교차점에서 그래프 노드가 자동 생성됩니다. 도로 사이 아무 지점도 출발·도착으로 지정할 수 있습니다.</span>
+        </div>
+        <div class="map-controls">
+          <button id="toggleBuildings">건물 숨기기</button>
+          <button id="toggleTrees">가로수 숨기기</button>
+          <button id="toggleShadows">그림자 숨기기</button>
+        </div>
+      </div>
+
+      <div id="map" class="map">
+        <svg id="citySvg" viewBox="0 0 1200 760" preserveAspectRatio="none" aria-label="가상 도심 도로 지도">
+          <g id="waterLayer"></g>
+          <g id="shadowLayer"></g>
+          <g id="buildingLayer"></g>
+          <g id="treeShadowLayer"></g>
+          <g id="treeLayer"></g>
+          <g id="roadLayer"></g>
+          <g id="algorithmLayer"></g>
+          <g id="routeLayer">
+            <polyline id="shortRoute" class="route short-route" points=""></polyline>
+            <polyline id="shadeRoute" class="route shade-route" points=""></polyline>
+          </g>
+          <g id="graphNodeLayer"></g>
+          <g id="markerLayer"></g>
+        </svg>
+        <div id="weightLayer" class="weight-layer"></div>
+        <div id="algoCostBadge" class="cost-badge hidden"></div>
+        <div id="hoverTip" class="hover-tip hidden"></div>
+        <div id="objectTip" class="object-tip hidden"></div>
+        <div class="map-note"><b>가상 데이터</b><span>실제 VWorld 연결 전 기능 검증용</span></div>
+      </div>
+
+      <div class="metrics">
+        <article>
+          <span>최단거리</span>
+          <b id="shortDist">—</b>
+          <small id="shortSun">햇빛 노출 —</small>
+        </article>
+        <article>
+          <span>그늘우선</span>
+          <b id="shadeDist">—</b>
+          <small id="shadeSun">햇빛 노출 —</small>
+        </article>
+        <article>
+          <span>추가 보행</span>
+          <b id="extraDist">—</b>
+          <small>그늘우선 − 최단거리</small>
+        </article>
+        <article>
+          <span>일사 노출 감소</span>
+          <b id="sunReduction">—</b>
+          <small>최단거리 대비</small>
+        </article>
+      </div>
+
+      <div class="data-summary">
+        <div><span>가상 건물</span><b id="buildingCount">—</b><small>높이·용도·외곽 데이터</small></div>
+        <div><span>가상 가로수</span><b id="treeCount">—</b><small>수종·수고·수관폭 데이터</small></div>
+        <div><span>도로 간선</span><b id="roadCount">—</b><small>길이·도로등급·그늘비율</small></div>
+        <div><span>시간별 그림자</span><b>동적</b><small>건물 + 가로수 별도 계산</small></div>
+      </div>
+
+      <div class="formula-box">
+        <b>현재 그늘 우선 가중치</b>
+        <span>간선 비용 = 건물 그늘 거리 × 1.0 + 가로수 그늘 거리 × 1.3 + 직사광선 거리 × 3.0</span>
+      </div>
+    </section>
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
