@@ -48,3 +48,61 @@ button,input{font:inherit}button{cursor:pointer}
 .building-symbol{width:11px;height:9px;background:rgba(93,105,115,.18);border:1px solid #65727c}
 .shadow-symbol{width:14px;height:8px;background:rgba(32,52,67,.26);transform:skewX(-24deg)}
 @media(max-width:560px){.badges{display:none}}
+
+/* zoom LOD optimization is handled in app.js */
+
+/* shortest vs shade route */
+:root{--short:#f0a51a;--shade:#16835a}
+.route-tabs{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:10px}
+.route-tab{border:1px solid var(--line);background:#fff;border-radius:9px;padding:8px 6px;font-size:10px;font-weight:800;color:var(--text)}
+.route-tab.active{border-color:var(--accent);background:#edf3ff;color:var(--accent)}
+.algo-buttons{margin-top:10px}
+.short-route-symbol{width:20px;height:0;border-top:4px dashed var(--short)}
+.shade-route-symbol{width:20px;height:0;border-top:4px solid var(--shade)}
+.weight-label.short{background:rgba(166,103,0,.92)}
+.weight-label.shade{background:rgba(18,111,72,.94)}
+.route-metrics{grid-template-columns:repeat(6,1fr)}
+.route-metrics article:nth-child(1){border-top:3px solid var(--short)}
+.route-metrics article:nth-child(2){border-top:3px solid var(--shade)}
+@media(max-width:1200px){.route-metrics{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:920px){.route-metrics{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:560px){.route-tabs{grid-template-columns:1fr 1fr 1fr}.route-metrics{grid-template-columns:1fr 1fr}}
+
+.priority-box{
+  margin-top:10px;
+  padding:11px;
+  border:1px solid var(--line);
+  border-radius:10px;
+  background:#f8fafb;
+}
+.priority-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  margin-bottom:8px;
+}
+.priority-head>div{display:grid;gap:2px}
+.priority-head span{font-size:10px;font-weight:800}
+.priority-head small{font-size:8px;color:var(--muted)}
+.priority-head>b{
+  min-width:48px;
+  text-align:center;
+  padding:6px 7px;
+  border-radius:8px;
+  background:#eaf4ef;
+  color:#16835a;
+  font-size:12px;
+}
+#shadePriorityRange{width:100%;accent-color:#16835a}
+.priority-scale{
+  display:grid;
+  grid-template-columns:1fr 1fr 1fr;
+  margin-top:4px;
+  color:var(--muted);
+  font-size:8px;
+}
+.priority-scale span{display:grid;gap:1px}
+.priority-scale span:nth-child(2){text-align:center}
+.priority-scale span:nth-child(3){text-align:right}
+.priority-scale small{font-size:7px;color:var(--muted)}

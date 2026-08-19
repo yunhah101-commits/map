@@ -15,7 +15,7 @@
   <header class="topbar">
     <div>
       <h1>그늘길 찾기</h1>
-      <p>VWorld 실제 지도 · 실제 보행망 · 다익스트라 최단경로</p>
+      <p>VWorld 실제 지도 · 실제 보행망 · 최단거리 vs 그늘우선 다익스트라</p>
     </div>
     <div class="badges">
       <span class="badge" id="networkBadge">보행망 불러오는 중…</span>
@@ -40,9 +40,9 @@
           <div><span>높이 보유</span><b id="heightCount">—</b></div>
         </div>
 
-        <button id="retryNetworkBtn" class="secondary compact">보행망 다시 불러오기</button>
+        <button id="retryNetworkBtn" class="secondary compact">보행망 캐시 초기화 · 다시 불러오기</button>
         <p class="help">
-          1km 원은 화면에 그리지 않고, 서초고등학교 주변 약 1km 범위만 내부적으로 사용합니다.
+          Overpass는 제거했습니다. 실제 보행망은 처음 한 번 OSM 공식 소형 영역 API로 받아 브라우저에 저장하고, 이후에는 저장된 캐시를 바로 사용합니다.
         </p>
       </section>
 
@@ -60,7 +60,27 @@
           <div><span>태양 고도</span><b id="sunAltitude">—</b></div>
           <div><span>방위각</span><b id="sunAzimuth">—</b></div>
         </div>
-        <p class="help">시간을 바꾸면 VWorld 실제 건물 높이를 이용해 그림자를 다시 계산합니다.</p>
+
+        <div class="priority-box">
+          <div class="priority-head">
+            <div>
+              <span>그늘 중요도</span>
+              <small>직사광선 1m에 부여하는 비용 배수</small>
+            </div>
+            <b id="shadePriorityLabel">3.0×</b>
+          </div>
+          <input id="shadePriorityRange" type="range" min="1" max="5" value="3" step="0.5">
+          <div class="priority-scale">
+            <span>1×<small>거리 위주</small></span>
+            <span>3×<small>기본</small></span>
+            <span>5×<small>그늘 강하게 우선</small></span>
+          </div>
+        </div>
+
+        <p class="help">
+          시간 또는 그늘 중요도를 바꾸면 그늘우선 경로를 다시 계산합니다.
+          1×에서는 햇빛과 그늘의 비용이 같아 사실상 최단거리와 동일해집니다.
+        </p>
       </section>
 
       <section>
@@ -75,12 +95,18 @@
           <div><span>도착</span><b id="endInfo">보행망 로딩 대기</b></div>
         </div>
 
-        <button id="routeBtn" class="primary" disabled>다익스트라 최단경로 계산</button>
+        <button id="routeBtn" class="primary" disabled>최단거리 + 그늘우선 계산</button>
         <button id="resetBtn" class="secondary">선택 초기화</button>
       </section>
 
       <section>
-        <div class="section-title"><span>04</span><h2>다익스트라 확인</h2></div>
+        <div class="section-title"><span>04</span><h2>경로 · 다익스트라</h2></div>
+
+        <div class="route-tabs">
+          <button class="route-tab active" data-route="both">함께 보기</button>
+          <button class="route-tab" data-route="shortest">최단거리</button>
+          <button class="route-tab" data-route="shade">그늘우선</button>
+        </div>
 
         <label class="check">
           <input id="showNetwork" type="checkbox" checked>
@@ -100,10 +126,14 @@
         </label>
         <label class="check">
           <input id="showWeights" type="checkbox" checked>
-          <span>최종 경로 누적 가중치 표시</span>
+          <span>선택 경로 누적 가중치 표시</span>
         </label>
 
-        <button id="animateBtn" class="secondary" disabled>다익스트라 탐색 재생</button>
+        <p class="help">성능 최적화: 지도를 멀리 축소하면 건물 그림자는 자동으로 숨기고, 확대 상태에서도 현재 화면 주변 건물만 렌더링합니다.</p>
+        <div class="two-buttons algo-buttons">
+          <button id="animateShortBtn" class="secondary" disabled>최단 재생</button>
+          <button id="animateShadeBtn" class="secondary" disabled>그늘 재생</button>
+        </div>
 
         <div class="algo-status" id="algoStatus" aria-live="polite">
           실제 보행 네트워크를 불러오고 있습니다.
@@ -133,7 +163,8 @@
           <span><i class="building-symbol"></i>실제 건물</span>
           <span><i class="shadow-symbol"></i>건물 그림자</span>
           <span><i class="network-symbol"></i>실제 보행망</span>
-          <span><i class="route-symbol"></i>최단경로</span>
+          <span><i class="short-route-symbol"></i>최단거리</span>
+          <span><i class="shade-route-symbol"></i>그늘우선</span>
           <span><i class="start-symbol"></i>S</span>
           <span><i class="end-symbol"></i>G</span>
         </div>
@@ -143,35 +174,45 @@
         </div>
       </div>
 
-      <div class="metrics">
+      <div class="metrics route-metrics">
         <article>
-          <span>최단거리</span>
-          <b id="routeDistance">—</b>
-          <small>실제 네트워크 간선 합</small>
+          <span>최단거리 경로</span>
+          <b id="shortDistance">—</b>
+          <small id="shortSun">햇빛 노출 —</small>
         </article>
         <article>
-          <span>경유 분기점</span>
-          <b id="routeNodes">—</b>
-          <small>S/G 포함</small>
+          <span>그늘우선 경로</span>
+          <b id="shadeDistance">—</b>
+          <small id="shadeSun">햇빛 노출 —</small>
         </article>
         <article>
-          <span>확정한 노드</span>
-          <b id="visitedNodes">—</b>
-          <small>Dijkstra 탐색량</small>
+          <span>추가 보행거리</span>
+          <b id="extraDistance">—</b>
+          <small>그늘우선 − 최단거리</small>
         </article>
         <article>
-          <span>도로 스냅 오차</span>
-          <b id="snapDistance">—</b>
-          <small>출발/도착 평균</small>
+          <span>햇빛 노출 감소</span>
+          <b id="exposureReduction">—</b>
+          <small>최단거리 대비</small>
+        </article>
+        <article>
+          <span>최단 경로 탐색량</span>
+          <b id="shortVisited">—</b>
+          <small>Dijkstra 확정 노드</small>
+        </article>
+        <article>
+          <span>그늘 경로 탐색량</span>
+          <b id="shadeVisited">—</b>
+          <small>Dijkstra 확정 노드</small>
         </article>
       </div>
 
       <div class="next-box">
-        <b>현재 구현</b>
+        <b>그늘우선 가중치</b>
         <span>
-          실제 보행망과 실제 건물 그림자까지 연결했습니다. 건물 그림자는 VWorld의 건물 외곽과 높이,
-          2026년 8월 1일의 시간대별 태양 고도·방위각을 이용한 1차 근사입니다.
-          다음 단계에서 가로수와 그림자 비율을 간선 가중치에 넣어 ‘그늘 우선 경로’를 계산합니다.
+          각 보행 간선을 약 8m 간격으로 샘플링해 건물 그림자 포함 여부를 판정합니다.
+          최단거리 비용 = 거리, <span id="shadeFormula">그늘우선 비용 = 건물그늘거리 × 1.0 + 직사광선거리 × 3.0</span> 입니다.
+          지도에서 멀리 축소하면 그림자 렌더링은 자동 제한되지만, 경로 계산에는 분석 범위의 실제 건물 그림자를 전체 사용합니다.
         </span>
       </div>
     </section>

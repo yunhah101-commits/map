@@ -5,6 +5,16 @@ const VWORLD_KEY = "C684FAA4-D7E2-3757-BD00-CA0565FBAC0D";
 const VWORLD_DOMAIN = "https://yunhah101-commits.github.io/map/";
 const REPRESENTATIVE_DATE = { year: 2026, month: 8, day: 1 };
 const SEOUL_TZ = 9;
+const WALK_CACHE_KEY = "shade-route-walk-graph-v4";
+const WALK_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const OSM_MAP_API = "https://api.openstreetmap.org/api/0.6/map.json";
+const SHADOW_MIN_ZOOM = 16;
+const BUILDING_MIN_ZOOM = 15;
+const SHADE_SAMPLE_STEP_M = 8;
+const SHADOW_GRID_M = 70;
+let sunPenalty = 3.0;
+let visualLodTimer = null;
+let routeRecalcTimer = null;
 
 const displayProjection = new OpenLayers.Projection("EPSG:4326");
 const mapProjection = new OpenLayers.Projection("EPSG:900913");
@@ -13,18 +23,18 @@ let map, vBase, shadowLayer, buildingLayer, networkLayer, junctionLayer, routeLa
 let baseGraph = null;
 let buildings = [];
 let buildingShadowPolygons = [];
+let analysisShadowIndex = null;
+let analysisShadowHour = null;
+let edgeShadeCache = new Map();
+let buildingReady = false;
 let networkReady = false;
 let selectMode = "start";
 let startSnap = null;
 let endSnap = null;
 let lastRoute = null;
+let routeView = "both";
 let animationTimer = null;
 
-const OVERPASS_ENDPOINTS = [
-  "https://overpass-api.de/api/interpreter",
-  "https://lz4.overpass-api.de/api/interpreter",
-  "https://z.overpass-api.de/api/interpreter"
-];
 
 function toRad(d) { return d * Math.PI / 180; }
 function toDeg(r) { return r * 180 / Math.PI; }
@@ -80,7 +90,7 @@ function initMap() {
   buildingLayer = new OpenLayers.Layer.Vector("실제 건물", {rendererOptions:{zIndexing:true}});
   networkLayer = new OpenLayers.Layer.Vector("실제 보행망", {rendererOptions:{zIndexing:true}});
   junctionLayer = new OpenLayers.Layer.Vector("분기점", {rendererOptions:{zIndexing:true}});
-  routeLayer = new OpenLayers.Layer.Vector("최단경로", {rendererOptions:{zIndexing:true}});
+  routeLayer = new OpenLayers.Layer.Vector("최단거리 + 그늘우선", {rendererOptions:{zIndexing:true}});
   algorithmLayer = new OpenLayers.Layer.Vector("Dijkstra 탐색", {rendererOptions:{zIndexing:true}});
   pointLayer = new OpenLayers.Layer.Vector("출발도착", {rendererOptions:{zIndexing:true}});
 
@@ -93,7 +103,7 @@ function initMap() {
   recenter();
   addSchoolMarker();
   map.events.register("click", map, handleMapClick);
-  map.events.register("moveend", map, renderWeightLabels);
+  map.events.register("moveend", map, handleMapMoveEnd);
 
   loadWalkingNetwork();
   loadVworldBuildings();
@@ -113,16 +123,15 @@ function addSchoolMarker() {
   })]);
 }
 
-function buildOverpassQuery() {
-  return `[out:json][timeout:18];
-way(around:${QUERY_RADIUS_M},${SCHOOL.lat},${SCHOOL.lon})
-  ["highway"~"^(footway|pedestrian|path|steps|living_street|residential|service|unclassified|tertiary)$"]
-  ["foot"!="no"]
-  ["access"!="private"];
-out geom;`;
+function isWalkableHighway(tags={}) {
+  const allowed = new Set([
+    "footway","pedestrian","path","steps","living_street",
+    "residential","service","unclassified","tertiary"
+  ]);
+  return allowed.has(tags.highway) && tags.foot !== "no" && tags.access !== "private";
 }
 
-async function fetchWithTimeout(url, options={}, timeoutMs=12000) {
+async function fetchWithTimeout(url, options={}, timeoutMs=15000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -132,71 +141,134 @@ async function fetchWithTimeout(url, options={}, timeoutMs=12000) {
   }
 }
 
-async function fetchOverpass() {
-  const query = buildOverpassQuery();
-  let lastError = null;
-
-  for (const endpoint of OVERPASS_ENDPOINTS) {
-    try {
-      const body = "data=" + encodeURIComponent(query);
-      const res = await fetchWithTimeout(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-          "Accept": "application/json"
-        },
-        body
-      }, 12000);
-
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      if (!Array.isArray(data.elements)) throw new Error("잘못된 Overpass 응답");
-      return data;
-    } catch (err) {
-      console.warn("Overpass endpoint failed:", endpoint, err);
-      lastError = err;
+function graphForCache(graph) {
+  return {
+    savedAt: Date.now(),
+    graph: {
+      nodes: graph.nodes,
+      edges: graph.edges,
+      junctionIds: [...graph.junctionIds]
     }
-  }
-
-  throw lastError || new Error("Overpass API 요청 실패");
+  };
 }
 
-async function loadWalkingNetwork() {
-  networkReady = false;
-  setNetworkStatus("loading","실제 보행 네트워크 로딩 중…");
-  const networkBadge = document.getElementById("networkBadge");
-  networkBadge.className = "badge";
-  networkBadge.textContent = "보행망 불러오는 중…";
-  document.getElementById("algoStatus").textContent = "실제 보행 네트워크를 불러오고 있습니다.";
+function graphFromCache(raw) {
+  if (!raw || !raw.graph || !raw.savedAt) return null;
+  if (Date.now() - raw.savedAt > WALK_CACHE_MAX_AGE_MS) return null;
+  const g=raw.graph;
+  if (!g.nodes || !Array.isArray(g.edges) || !Array.isArray(g.junctionIds)) return null;
+  return {nodes:g.nodes, edges:g.edges, junctionIds:new Set(g.junctionIds)};
+}
+
+function readWalkCache() {
+  try {
+    const raw=JSON.parse(localStorage.getItem(WALK_CACHE_KEY) || "null");
+    return graphFromCache(raw);
+  } catch (_) { return null; }
+}
+
+function saveWalkCache(graph) {
+  try {
+    localStorage.setItem(WALK_CACHE_KEY, JSON.stringify(graphForCache(graph)));
+    return true;
+  } catch (err) {
+    console.warn("보행망 캐시 저장 실패",err);
+    return false;
+  }
+}
+
+function clearWalkCache() {
+  try { localStorage.removeItem(WALK_CACHE_KEY); } catch (_) {}
+}
+
+function makeOsmTileBboxes() {
+  const b=bboxAroundSchool(QUERY_RADIUS_M + SCOPE_MARGIN_M);
+  const midLon=(b.minLon+b.maxLon)/2;
+  const midLat=(b.minLat+b.maxLat)/2;
+  return [
+    [b.minLon,b.minLat,midLon,midLat],
+    [midLon,b.minLat,b.maxLon,midLat],
+    [b.minLon,midLat,midLon,b.maxLat],
+    [midLon,midLat,b.maxLon,b.maxLat]
+  ];
+}
+
+async function fetchOsmTile(bbox) {
+  const url=OSM_MAP_API+"?bbox="+bbox.map(v=>v.toFixed(7)).join(",");
+  const res=await fetchWithTimeout(url,{headers:{"Accept":"application/json"}},18000);
+  if(!res.ok) throw new Error(`OSM HTTP ${res.status}`);
+  const data=await res.json();
+  if(!Array.isArray(data.elements)) throw new Error("OSM 지도 응답 형식 오류");
+  return data;
+}
+
+async function fetchOsmMapSmallTiles() {
+  const tiles=makeOsmTileBboxes();
+  const payloads=[];
+  // 한 번에 4개를 때리지 않고 2개씩 처리해 공식 API 부하를 줄인다.
+  for(let i=0;i<tiles.length;i+=2) {
+    const batch=await Promise.all(tiles.slice(i,i+2).map(fetchOsmTile));
+    payloads.push(...batch);
+  }
+  const elementMap=new Map();
+  for(const data of payloads) {
+    for(const el of data.elements || []) {
+      if(el.type!=="node" && el.type!=="way") continue;
+      elementMap.set(`${el.type}/${el.id}`,el);
+    }
+  }
+  return {elements:[...elementMap.values()]};
+}
+
+async function loadWalkingNetwork({force=false}={}) {
+  networkReady=false;
+  setNetworkStatus("loading","보행 네트워크 준비 중…");
+  const badge=document.getElementById("networkBadge");
+  badge.className="badge";
+  badge.textContent="보행망 준비 중…";
+  document.getElementById("algoStatus").textContent="실제 보행 네트워크를 준비하고 있습니다.";
 
   try {
-    const data = await fetchOverpass();
-    baseGraph = parseAndCompressOSM(data);
+    if(force) clearWalkCache();
+    if(!force) {
+      const cached=readWalkCache();
+      if(cached && cached.edges.length) {
+        baseGraph=cached;
+        finishWalkingNetworkLoad("브라우저 캐시");
+        return;
+      }
+    }
 
-    if (!baseGraph || baseGraph.edges.length === 0) throw new Error("사용 가능한 보행 간선이 없습니다.");
-
-    drawNetwork();
-    drawJunctions();
-
-    networkReady = true;
-    document.getElementById("nodeCount").textContent = baseGraph.junctionIds.size.toLocaleString()+"개";
-    document.getElementById("edgeCount").textContent = baseGraph.edges.length.toLocaleString()+"개";
-    document.getElementById("networkBadge").textContent = "실제 보행망 연결됨";
-    document.getElementById("networkBadge").classList.add("live");
-    setNetworkStatus("ok",`실제 보행망 ${baseGraph.edges.length.toLocaleString()}개 간선`);
-    document.getElementById("guideTitle").textContent = "출발점을 선택하세요";
-    document.getElementById("guideText").textContent = "지도 아무 곳을 클릭하면 가장 가까운 보행도로에 자동으로 붙습니다.";
-    document.getElementById("algoStatus").textContent = "출발점과 도착점을 선택하세요.";
-    syncUI();
-  } catch (err) {
+    const data=await fetchOsmMapSmallTiles();
+    baseGraph=parseAndCompressOSM(data);
+    if(!baseGraph || baseGraph.edges.length===0) throw new Error("사용 가능한 보행 간선이 없습니다.");
+    saveWalkCache(baseGraph);
+    finishWalkingNetworkLoad("OSM 공식 API · 캐시 저장");
+  } catch(err) {
     console.error(err);
-    document.getElementById("networkBadge").textContent = "보행망 로딩 실패";
-    document.getElementById("networkBadge").classList.add("error");
+    badge.textContent="보행망 로딩 실패";
+    badge.classList.add("error");
     setNetworkStatus("error","보행 네트워크 로딩 실패");
-    document.getElementById("guideTitle").textContent = "보행망을 불러오지 못했습니다";
-    document.getElementById("guideText").textContent = "새로고침하거나 잠시 뒤 다시 시도하세요.";
-    document.getElementById("algoStatus").textContent = "공개 보행망 서버가 응답하지 않았습니다. ‘보행망 다시 불러오기’를 눌러주세요.";
+    document.getElementById("guideTitle").textContent="보행망을 불러오지 못했습니다";
+    document.getElementById("guideText").textContent="네트워크 연결 후 ‘보행망 다시 불러오기’를 눌러주세요.";
+    document.getElementById("algoStatus").textContent="이번 버전은 Overpass를 사용하지 않습니다. OSM 공식 소형 영역 API를 1회 호출한 뒤 브라우저에 캐시합니다.";
   }
+}
+
+function finishWalkingNetworkLoad(sourceLabel) {
+  drawNetwork();
+  drawJunctions();
+  networkReady=true;
+  document.getElementById("nodeCount").textContent=baseGraph.junctionIds.size.toLocaleString()+"개";
+  document.getElementById("edgeCount").textContent=baseGraph.edges.length.toLocaleString()+"개";
+  const badge=document.getElementById("networkBadge");
+  badge.textContent="실제 보행망 연결됨";
+  badge.classList.add("live");
+  setNetworkStatus("ok",`실제 보행망 ${baseGraph.edges.length.toLocaleString()}개 · ${sourceLabel}`);
+  document.getElementById("guideTitle").textContent="출발점을 선택하세요";
+  document.getElementById("guideText").textContent="지도 아무 곳을 클릭하면 가장 가까운 보행도로에 자동으로 붙습니다.";
+  document.getElementById("algoStatus").textContent="출발점과 도착점을 선택하세요.";
+  syncUI();
 }
 
 function setNetworkStatus(state,text) {
@@ -206,174 +278,96 @@ function setNetworkStatus(state,text) {
 }
 
 function parseAndCompressOSM(data) {
-  const osmNodes = new Map();
-  const ways = [];
+  const osmNodes=new Map();
+  const ways=[];
 
-  for (const el of data.elements || []) {
-    if (el.type !== "way" || !Array.isArray(el.nodes) || !Array.isArray(el.geometry)) continue;
-
-    const count = Math.min(el.nodes.length, el.geometry.length);
-    if (count < 2) continue;
-
-    const ids = [];
-    for (let i=0; i<count; i++) {
-      const geo = el.geometry[i];
-      if (!geo) continue;
-
-      const id = String(el.nodes[i]);
-      if (!osmNodes.has(id)) {
-        const ll = {lon:Number(geo.lon), lat:Number(geo.lat)};
-        const xy = llToXY(ll);
-        osmNodes.set(id, {id, ...ll, ...xy});
-      }
-      ids.push(id);
-    }
-
-    if (ids.length >= 2) {
-      ways.push({id:String(el.id), nodes:ids, tags:el.tags || {}});
+  for(const el of data.elements || []) {
+    if(el.type==="node" && Number.isFinite(Number(el.lon)) && Number.isFinite(Number(el.lat))) {
+      const id=String(el.id),ll={lon:Number(el.lon),lat:Number(el.lat)},xy=llToXY(ll);
+      osmNodes.set(id,{id,...ll,...xy});
     }
   }
-
-  const rawSegments = [];
-  const rawAdj = new Map();
-  let segIndex = 0;
-
-  function addAdj(nodeId, segId) {
-    if (!rawAdj.has(nodeId)) rawAdj.set(nodeId, []);
-    rawAdj.get(nodeId).push(segId);
+  for(const el of data.elements || []) {
+    if(el.type!=="way" || !Array.isArray(el.nodes) || el.nodes.length<2 || !isWalkableHighway(el.tags||{})) continue;
+    ways.push({id:String(el.id),nodes:el.nodes.map(String),tags:el.tags||{}});
   }
 
-  for (const way of ways) {
-    for (let i=0; i<way.nodes.length-1; i++) {
-      const aId=String(way.nodes[i]), bId=String(way.nodes[i+1]);
-      const A=osmNodes.get(aId), B=osmNodes.get(bId);
-      if (!A || !B) continue;
+  const rawSegments=[];
+  const rawAdj=new Map();
+  let segIndex=0;
+  function addAdj(nodeId,segId){ if(!rawAdj.has(nodeId))rawAdj.set(nodeId,[]); rawAdj.get(nodeId).push(segId); }
 
+  for(const way of ways) {
+    for(let i=0;i<way.nodes.length-1;i++) {
+      const aId=way.nodes[i],bId=way.nodes[i+1],A=osmNodes.get(aId),B=osmNodes.get(bId);
+      if(!A||!B) continue;
       const mid={lon:(A.lon+B.lon)/2,lat:(A.lat+B.lat)/2};
-      if (haversine(SCHOOL,mid) > QUERY_RADIUS_M + SCOPE_MARGIN_M) continue;
-
+      if(haversine(SCHOOL,mid)>QUERY_RADIUS_M+SCOPE_MARGIN_M) continue;
       const length=haversine(A,B);
-      if (length < 0.05 || length > 500) continue;
-
+      if(length<0.05||length>500) continue;
       const id="R"+(segIndex++);
-      rawSegments.push({
-        id, a:aId, b:bId, length,
-        tags:way.tags || {},
-        wayId:way.id
-      });
-      addAdj(aId,id);
-      addAdj(bId,id);
+      rawSegments.push({id,a:aId,b:bId,length,tags:way.tags,wayId:way.id});
+      addAdj(aId,id); addAdj(bId,id);
     }
   }
 
   const segMap=new Map(rawSegments.map(s=>[s.id,s]));
   const junctionIds=new Set();
-
-  for (const [nodeId, segIds] of rawAdj.entries()) {
+  for(const [nodeId,segIds] of rawAdj.entries()) {
     const neighbors=new Set();
-    for (const sid of segIds) {
-      const s=segMap.get(sid);
-      neighbors.add(s.a===nodeId ? s.b : s.a);
-    }
-    if (neighbors.size !== 2) junctionIds.add(nodeId);
+    for(const sid of segIds) { const s=segMap.get(sid); if(s)neighbors.add(s.a===nodeId?s.b:s.a); }
+    if(neighbors.size!==2) junctionIds.add(nodeId);
+  }
+  for(const way of ways) {
+    if(!way.nodes.length)continue;
+    const a=way.nodes[0],b=way.nodes[way.nodes.length-1];
+    if(rawAdj.has(a))junctionIds.add(a);
+    if(rawAdj.has(b))junctionIds.add(b);
   }
 
-  for (const way of ways) {
-    if (!way.nodes.length) continue;
-    const a=way.nodes[0], b=way.nodes[way.nodes.length-1];
-    if (rawAdj.has(a)) junctionIds.add(a);
-    if (rawAdj.has(b)) junctionIds.add(b);
-  }
-
-  const visited=new Set();
-  const edges=[];
+  const visited=new Set(),edges=[];
   let edgeIndex=0;
-  const otherNode=(seg,nodeId)=>seg.a===nodeId ? seg.b : seg.a;
-
-  for (const startId of junctionIds) {
-    const incident=rawAdj.get(startId) || [];
-
-    for (const firstSegId of incident) {
-      if (visited.has(firstSegId)) continue;
-
-      const startNode=osmNodes.get(startId);
-      if (!startNode) continue;
-
+  const otherNode=(seg,nodeId)=>seg.a===nodeId?seg.b:seg.a;
+  for(const startId of junctionIds) {
+    for(const firstSegId of rawAdj.get(startId)||[]) {
+      if(visited.has(firstSegId))continue;
+      const startNode=osmNodes.get(startId); if(!startNode)continue;
       const geometry=[{lon:startNode.lon,lat:startNode.lat,x:startNode.x,y:startNode.y}];
-      let currentNode=startId;
-      let currentSegId=firstSegId;
-      let total=0;
-      let guard=0;
-      let roadType="path";
-
-      while (currentSegId && guard++ < 3000) {
-        if (visited.has(currentSegId)) break;
+      let currentNode=startId,currentSegId=firstSegId,total=0,guard=0,roadType="path";
+      while(currentSegId&&guard++<3000) {
+        if(visited.has(currentSegId))break;
         visited.add(currentSegId);
-
-        const seg=segMap.get(currentSegId);
-        if (!seg) break;
-        roadType=seg.tags.highway || roadType;
-
-        const nextNodeId=otherNode(seg,currentNode);
-        const nextNode=osmNodes.get(nextNodeId);
-        if (!nextNode) break;
-
-        geometry.push({lon:nextNode.lon,lat:nextNode.lat,x:nextNode.x,y:nextNode.y});
-        total += seg.length;
-
-        if (junctionIds.has(nextNodeId)) {
-          if (nextNodeId !== startId || geometry.length > 2) {
-            edges.push({
-              id:"E"+(edgeIndex++),
-              a:startId,b:nextNodeId,
-              length:total,geometry,roadType
-            });
-          }
+        const seg=segMap.get(currentSegId); if(!seg)break;
+        roadType=seg.tags.highway||roadType;
+        const nextNodeId=otherNode(seg,currentNode),nextNode=osmNodes.get(nextNodeId); if(!nextNode)break;
+        geometry.push({lon:nextNode.lon,lat:nextNode.lat,x:nextNode.x,y:nextNode.y}); total+=seg.length;
+        if(junctionIds.has(nextNodeId)) {
+          if(nextNodeId!==startId||geometry.length>2)edges.push({id:"E"+(edgeIndex++),a:startId,b:nextNodeId,length:total,geometry,roadType});
           break;
         }
-
-        const candidates=(rawAdj.get(nextNodeId) || []).filter(sid=>sid!==currentSegId);
-        if (!candidates.length) break;
-        currentNode=nextNodeId;
-        currentSegId=candidates[0];
+        const candidates=(rawAdj.get(nextNodeId)||[]).filter(sid=>sid!==currentSegId);
+        if(!candidates.length)break;
+        currentNode=nextNodeId; currentSegId=candidates[0];
       }
     }
   }
 
-  // Any remaining closed loops / isolated segments.
-  for (const seg of rawSegments) {
-    if (visited.has(seg.id)) continue;
-
-    const A=osmNodes.get(seg.a), B=osmNodes.get(seg.b);
-    if (!A || !B) continue;
-
-    junctionIds.add(seg.a);
-    junctionIds.add(seg.b);
-    edges.push({
-      id:"E"+(edgeIndex++),
-      a:seg.a,b:seg.b,length:seg.length,
-      geometry:[
-        {lon:A.lon,lat:A.lat,x:A.x,y:A.y},
-        {lon:B.lon,lat:B.lat,x:B.x,y:B.y}
-      ],
-      roadType:seg.tags.highway || "path"
-    });
+  for(const seg of rawSegments) {
+    if(visited.has(seg.id))continue;
+    const A=osmNodes.get(seg.a),B=osmNodes.get(seg.b); if(!A||!B)continue;
+    junctionIds.add(seg.a);junctionIds.add(seg.b);
+    edges.push({id:"E"+(edgeIndex++),a:seg.a,b:seg.b,length:seg.length,geometry:[
+      {lon:A.lon,lat:A.lat,x:A.x,y:A.y},{lon:B.lon,lat:B.lat,x:B.x,y:B.y}
+    ],roadType:seg.tags.highway||"path"});
   }
 
   const nodes={};
-  for (const id of junctionIds) {
-    const n=osmNodes.get(id);
-    if (n) nodes[id]={id,lon:n.lon,lat:n.lat,x:n.x,y:n.y};
-  }
-
-  for (const e of edges) {
+  for(const id of junctionIds){const n=osmNodes.get(id);if(n)nodes[id]={id,lon:n.lon,lat:n.lat,x:n.x,y:n.y};}
+  for(const e of edges){
     e.cum=[0];
-    for (let i=1; i<e.geometry.length; i++) {
-      e.cum.push(e.cum[i-1] + pointDistance(e.geometry[i-1],e.geometry[i]));
-    }
-    e.planarLength=e.cum[e.cum.length-1] || e.length;
+    for(let i=1;i<e.geometry.length;i++)e.cum.push(e.cum[i-1]+pointDistance(e.geometry[i-1],e.geometry[i]));
+    e.planarLength=e.cum[e.cum.length-1]||e.length;
   }
-
   return {nodes,edges,junctionIds};
 }
 
@@ -485,8 +479,9 @@ async function loadVworldBuildings() {
     }
 
     buildings=features.map(parseBuildingFeature).filter(Boolean);
-    drawBuildings();
-    updateBuildingShadows();
+    buildingReady=true;
+    invalidateShadeAnalysis();
+    scheduleVisualLodUpdate();
 
     document.getElementById("buildingCount").textContent=buildings.length.toLocaleString()+"개";
     document.getElementById("heightCount").textContent=buildings.filter(b=>b.height>0).length.toLocaleString()+"개";
@@ -494,8 +489,10 @@ async function loadVworldBuildings() {
     badge.textContent="실제 건물 연결됨";
     badge.classList.add("live");
     setBuildingStatus("ok",`VWorld 건물 ${buildings.length.toLocaleString()}개`);
+    syncUI();
   } catch (err) {
     console.error("VWorld building error:",err);
+    buildingReady=false;
     badge.textContent="건물 로딩 실패";
     badge.classList.add("error");
     setBuildingStatus("error","VWorld 건물 로딩 실패");
@@ -537,11 +534,17 @@ function parseBuildingFeature(feature) {
     height=Number.isFinite(floors) && floors>0 ? floors*3.3 : 0;
   }
 
+  const all=rings.flat();
+  const bbox={
+    minLon:Math.min(...all.map(p=>p.lon)), maxLon:Math.max(...all.map(p=>p.lon)),
+    minLat:Math.min(...all.map(p=>p.lat)), maxLat:Math.max(...all.map(p=>p.lat))
+  };
   return {
     id:feature.id || "",
     name:props.bld_nm || "",
     height,
     rings,
+    bbox,
     properties:props
   };
 }
@@ -559,26 +562,45 @@ function olPolygonFromLonLatRing(ring) {
   ]);
 }
 
+function currentViewBounds(padRatio=0.08) {
+  if(!map) return bboxAroundSchool(QUERY_RADIUS_M+SCOPE_MARGIN_M);
+  const ext=map.getExtent();
+  if(!ext) return bboxAroundSchool(QUERY_RADIUS_M+SCOPE_MARGIN_M);
+  const b=ext.clone().transform(mapProjection,displayProjection);
+  const dx=(b.right-b.left)*padRatio,dy=(b.top-b.bottom)*padRatio;
+  return {minLon:b.left-dx,minLat:b.bottom-dy,maxLon:b.right+dx,maxLat:b.top+dy};
+}
+function bboxIntersects(a,b){return !(a.maxLon<b.minLon||a.minLon>b.maxLon||a.maxLat<b.minLat||a.minLat>b.maxLat);}
+function visibleBuildings(limit=Infinity) {
+  const bounds=currentViewBounds();
+  const center=map.getCenter()?.clone().transform(mapProjection,displayProjection);
+  let arr=buildings.filter(b=>b.bbox&&bboxIntersects(b.bbox,bounds));
+  if(arr.length>limit && center) {
+    arr.sort((a,b)=>{
+      const ac={lon:(a.bbox.minLon+a.bbox.maxLon)/2,lat:(a.bbox.minLat+a.bbox.maxLat)/2};
+      const bc={lon:(b.bbox.minLon+b.bbox.maxLon)/2,lat:(b.bbox.minLat+b.bbox.maxLat)/2};
+      return haversine({lon:center.lon,lat:center.lat},ac)-haversine({lon:center.lon,lat:center.lat},bc);
+    });
+    arr=arr.slice(0,limit);
+  }
+  return arr;
+}
 function drawBuildings() {
+  if(!buildingLayer||!map)return;
   buildingLayer.removeAllFeatures();
+  const zoom=map.getZoom();
+  if(zoom<BUILDING_MIN_ZOOM)return;
+  const limit=zoom<=15?900:zoom===16?1600:3000;
   const features=[];
-
-  for (const b of buildings) {
-    for (const ring of b.rings) {
+  for(const b of visibleBuildings(limit)) {
+    for(const ring of b.rings) {
       features.push(new OpenLayers.Feature.Vector(
-        olPolygonFromLonLatRing(ring),
-        {height:b.height,name:b.name},
-        {
-          strokeColor:"#596773",
-          strokeWidth:1,
-          strokeOpacity:.65,
-          fillColor:"#71808a",
-          fillOpacity:.10
+        olPolygonFromLonLatRing(ring),{height:b.height,name:b.name},{
+          strokeColor:"#596773",strokeWidth:1,strokeOpacity:.62,fillColor:"#71808a",fillOpacity:.09
         }
       ));
     }
   }
-
   buildingLayer.addFeatures(features);
 }
 
@@ -659,7 +681,7 @@ function convexHull(points) {
   return lower.concat(upper);
 }
 
-function makeBuildingShadowPolygon(ring,height,sun) {
+function makeBuildingShadowPolygonXY(ring,height,sun) {
   if (!height || height<=0 || sun.altitude<=3) return null;
 
   const length=Math.min(450,height/Math.tan(toRad(sun.altitude)));
@@ -671,43 +693,189 @@ function makeBuildingShadowPolygon(ring,height,sun) {
 
   const original=ring.map(llToXY);
   const shifted=original.map(p=>({x:p.x+dx,y:p.y+dy}));
-  const hull=convexHull(original.concat(shifted));
+  return convexHull(original.concat(shifted));
+}
 
-  return hull.map(xyToLL);
+function makeBuildingShadowPolygon(ring,height,sun) {
+  const xy=makeBuildingShadowPolygonXY(ring,height,sun);
+  return xy ? xy.map(xyToLL) : null;
+}
+
+function polygonBBoxXY(poly) {
+  return {
+    minX:Math.min(...poly.map(p=>p.x)), maxX:Math.max(...poly.map(p=>p.x)),
+    minY:Math.min(...poly.map(p=>p.y)), maxY:Math.max(...poly.map(p=>p.y))
+  };
+}
+
+function pointInPolygonXY(p,poly) {
+  let inside=false;
+  for(let i=0,j=poly.length-1;i<poly.length;j=i++) {
+    const a=poly[i],b=poly[j];
+    const hit=((a.y>p.y)!==(b.y>p.y)) &&
+      (p.x < (b.x-a.x)*(p.y-a.y)/(b.y-a.y+1e-12)+a.x);
+    if(hit) inside=!inside;
+  }
+  return inside;
+}
+
+function shadowGridKey(gx,gy){ return gx+","+gy; }
+
+function invalidateShadeAnalysis() {
+  analysisShadowIndex=null;
+  analysisShadowHour=null;
+  edgeShadeCache.clear();
+}
+
+function buildShadowAnalysisIndex(hour) {
+  if(analysisShadowIndex && analysisShadowHour===hour) return analysisShadowIndex;
+
+  const sun=solarPosition(hour);
+  const polygons=[];
+  const grid=new Map();
+
+  for(const b of buildings) {
+    if(!(b.height>0)) continue;
+    for(const ring of b.rings) {
+      const poly=makeBuildingShadowPolygonXY(ring,b.height,sun);
+      if(!poly || poly.length<3) continue;
+      const bbox=polygonBBoxXY(poly);
+      const index=polygons.length;
+      polygons.push({poly,bbox});
+
+      const minGX=Math.floor(bbox.minX/SHADOW_GRID_M), maxGX=Math.floor(bbox.maxX/SHADOW_GRID_M);
+      const minGY=Math.floor(bbox.minY/SHADOW_GRID_M), maxGY=Math.floor(bbox.maxY/SHADOW_GRID_M);
+      for(let gx=minGX;gx<=maxGX;gx++) for(let gy=minGY;gy<=maxGY;gy++) {
+        const key=shadowGridKey(gx,gy);
+        if(!grid.has(key)) grid.set(key,[]);
+        grid.get(key).push(index);
+      }
+    }
+  }
+
+  analysisShadowHour=hour;
+  analysisShadowIndex={hour,polygons,grid};
+  return analysisShadowIndex;
+}
+
+function isPointInBuildingShadowXY(p,index) {
+  const key=shadowGridKey(Math.floor(p.x/SHADOW_GRID_M),Math.floor(p.y/SHADOW_GRID_M));
+  const candidates=index.grid.get(key)||[];
+  for(const idx of candidates) {
+    const item=index.polygons[idx],b=item.bbox;
+    if(p.x<b.minX||p.x>b.maxX||p.y<b.minY||p.y>b.maxY) continue;
+    if(pointInPolygonXY(p,item.poly)) return true;
+  }
+  return false;
+}
+
+function analyzeEdgeExposure(edge,index) {
+  let shadePlanar=0,sunPlanar=0,totalPlanar=0;
+  const geom=edge.geometry||[];
+  for(let i=0;i<geom.length-1;i++) {
+    const A=geom[i],B=geom[i+1];
+    const segLen=pointDistance(A,B);
+    if(segLen<=0) continue;
+    const pieces=Math.max(1,Math.ceil(segLen/SHADE_SAMPLE_STEP_M));
+    const pieceLen=segLen/pieces;
+    for(let k=0;k<pieces;k++) {
+      const t=(k+0.5)/pieces;
+      const p={x:A.x+(B.x-A.x)*t,y:A.y+(B.y-A.y)*t};
+      if(isPointInBuildingShadowXY(p,index)) shadePlanar+=pieceLen;
+      else sunPlanar+=pieceLen;
+    }
+    totalPlanar+=segLen;
+  }
+
+  const scale=totalPlanar>0 ? edge.length/totalPlanar : 1;
+  const shadeDistance=shadePlanar*scale;
+  const sunDistance=sunPlanar*scale;
+  return {
+    shadeDistance,
+    sunDistance,
+    shadeFraction:edge.length>0?shadeDistance/edge.length:0
+  };
+}
+
+async function annotateGraphShadeCosts(g) {
+  const hour=Number(document.getElementById("timeRange").value);
+  const index=buildShadowAnalysisIndex(hour);
+  const baseById=new Map((baseGraph?.edges||[]).map(e=>[e.id,e]));
+  const cachePrefix=hour+":";
+
+  for(let i=0;i<g.edges.length;i++) {
+    const e=g.edges[i];
+    let stats=null;
+    const base=baseById.get(e.baseId);
+    const fullBase=!!base && Math.abs(base.length-e.length)<0.05;
+    if(fullBase) {
+      const key=cachePrefix+e.baseId;
+      stats=edgeShadeCache.get(key)||null;
+      if(!stats) {
+        stats=analyzeEdgeExposure(base,index);
+        edgeShadeCache.set(key,stats);
+      }
+    } else {
+      stats=analyzeEdgeExposure(e,index);
+    }
+    e.distanceCost=e.length;
+    e.shadeDistance=stats.shadeDistance;
+    e.sunDistance=stats.sunDistance;
+    e.shadeFraction=stats.shadeFraction;
+    e.shadeCost=stats.shadeDistance + stats.sunDistance*sunPenalty;
+
+    if(i%90===0) {
+      document.getElementById("algoStatus").textContent=
+        `도로별 일사 비용 분석 중… ${Math.round(i/g.edges.length*100)}%`;
+      await new Promise(r=>setTimeout(r,0));
+    }
+  }
+}
+
+function pathExposureMetrics(edges) {
+  return edges.reduce((m,e)=>{
+    m.distance+=e.length;
+    m.shade+=e.shadeDistance||0;
+    m.sun+=e.sunDistance??e.length;
+    return m;
+  },{distance:0,shade:0,sun:0});
 }
 
 function updateBuildingShadows() {
-  if (!shadowLayer) return;
-
+  if(!shadowLayer||!map)return;
   shadowLayer.removeAllFeatures();
   buildingShadowPolygons=[];
-  if (!buildings.length) return;
-
-  const hour=Number(document.getElementById("timeRange").value);
-  const sun=solarPosition(hour);
-  const features=[];
-
-  for (const b of buildings) {
-    for (const ring of b.rings) {
+  if(!buildings.length||!document.getElementById("showShadows").checked)return;
+  const zoom=map.getZoom();
+  // 멀리 축소했을 때 수천 개 그림자를 만들지 않는다.
+  if(zoom<SHADOW_MIN_ZOOM)return;
+  const limit=zoom===16?550:zoom===17?1200:2400;
+  const hour=Number(document.getElementById("timeRange").value),sun=solarPosition(hour),features=[];
+  const targets=visibleBuildings(limit).filter(b=>b.height>0);
+  for(const b of targets) {
+    for(const ring of b.rings) {
       const shadow=makeBuildingShadowPolygon(ring,b.height,sun);
-      if (!shadow || shadow.length<3) continue;
-
+      if(!shadow||shadow.length<3)continue;
       buildingShadowPolygons.push(shadow);
       features.push(new OpenLayers.Feature.Vector(
-        olPolygonFromLonLatRing(shadow),
-        {height:b.height},
-        {
-          strokeColor:"#283846",
-          strokeWidth:.4,
-          strokeOpacity:.10,
-          fillColor:"#243847",
-          fillOpacity:.22
+        olPolygonFromLonLatRing(shadow),{height:b.height},{
+          strokeColor:"#283846",strokeWidth:.35,strokeOpacity:.08,fillColor:"#243847",fillOpacity:.20
         }
       ));
     }
   }
-
   shadowLayer.addFeatures(features);
+}
+function scheduleVisualLodUpdate() {
+  if(visualLodTimer)clearTimeout(visualLodTimer);
+  visualLodTimer=setTimeout(()=>{
+    drawBuildings();
+    updateBuildingShadows();
+  },120);
+}
+function handleMapMoveEnd() {
+  renderWeightLabels();
+  scheduleVisualLodUpdate();
 }
 
 function nearestEdgeSnap(ll) {
@@ -889,7 +1057,7 @@ class MinHeap {
   get size() { return this.a.length; }
 }
 
-function dijkstra(g,record=false) {
+function dijkstra(g,mode="distance",record=false) {
   const adj={};
   for(const id of Object.keys(g.nodes)) adj[id]=[];
   for(const e of g.edges) {
@@ -912,13 +1080,13 @@ function dijkstra(g,record=false) {
     if(cur.d!==D[cur.id]) continue;
 
     visited.add(cur.id);
-    if(record && steps.length<2500) steps.push({node:cur.id,dist:cur.d,visited:visited.size});
-
+    if(record && steps.length<3000) steps.push({node:cur.id,dist:cur.d,visited:visited.size,mode});
     if(cur.id===g.endNodeId) break;
 
     for(const item of adj[cur.id]||[]) {
       if(visited.has(item.to)) continue;
-      const alt=cur.d+item.edge.length;
+      const edgeCost=mode==="shade" ? item.edge.shadeCost : item.edge.distanceCost;
+      const alt=cur.d+edgeCost;
       if(alt<D[item.to]) {
         D[item.to]=alt;
         prev[item.to]={node:cur.id,edge:item.edge};
@@ -942,40 +1110,61 @@ function dijkstra(g,record=false) {
     }
   }
 
-  return {distance:D[g.endNodeId],nodePath,edgePath,D,visitedCount:visited.size,steps};
+  return {cost:D[g.endNodeId],nodePath,edgePath,D,visitedCount:visited.size,steps,mode};
 }
 
-function calculateRoute() {
-  if(!startSnap||!endSnap||!networkReady)return;
+async function calculateRoute({silent=false}={}) {
+  if(!startSnap||!endSnap||!networkReady||!buildingReady)return;
 
   resetAnimation();
-  const g=buildDynamicGraph();
-  const result=dijkstra(g,true);
+  const button=document.getElementById("routeBtn");
+  button.disabled=true;
+  if(!silent) document.getElementById("algoStatus").textContent="건물 그림자와 보행 간선의 일사 노출을 분석합니다.";
 
-  if(!Number.isFinite(result.distance) || result.edgePath.length===0) {
-    document.getElementById("algoStatus").textContent="연결 가능한 보행 경로를 찾지 못했습니다. 다른 지점을 선택해 보세요.";
-    return;
+  try {
+    const g=buildDynamicGraph();
+    await annotateGraphShadeCosts(g);
+
+    const shortest=dijkstra(g,"distance",true);
+    const shade=dijkstra(g,"shade",true);
+
+    if(!Number.isFinite(shortest.cost)||!Number.isFinite(shade.cost)||!shortest.edgePath.length||!shade.edgePath.length) {
+      document.getElementById("algoStatus").textContent="연결 가능한 보행 경로를 찾지 못했습니다. 다른 지점을 선택해 보세요.";
+      return;
+    }
+
+    const shortMetrics=pathExposureMetrics(shortest.edgePath);
+    const shadeMetrics=pathExposureMetrics(shade.edgePath);
+    lastRoute={g,shortest,shade,shortMetrics,shadeMetrics};
+
+    drawRoutes();
+    renderWeightLabels();
+    renderRouteMetrics();
+
+    document.getElementById("algoStatus").textContent=
+      `계산 완료 · 그늘 중요도 ${sunPenalty.toFixed(1)}× · 최단 ${Math.round(shortMetrics.distance)}m / 그늘우선 ${Math.round(shadeMetrics.distance)}m · 햇빛 노출 ${Math.round(shortMetrics.sun)}m → ${Math.round(shadeMetrics.sun)}m`;
+
+    document.getElementById("animateShortBtn").disabled=false;
+    document.getElementById("animateShadeBtn").disabled=false;
+    document.getElementById("guideTitle").textContent="두 경로 계산 완료";
+    document.getElementById("guideText").textContent="주황 점선은 최단거리, 초록 실선은 건물 그림자를 반영한 그늘우선 경로입니다.";
+  } finally {
+    syncUI();
   }
+}
 
-  lastRoute={g,result};
-  drawRoute(lastRoute);
-  renderWeightLabels();
-
-  document.getElementById("routeDistance").textContent=result.distance<1000
-    ? Math.round(result.distance)+" m"
-    : (result.distance/1000).toFixed(2)+" km";
-  document.getElementById("routeNodes").textContent=result.nodePath.length+"개";
-  document.getElementById("visitedNodes").textContent=result.visitedCount.toLocaleString()+"개";
-
-  const avgSnap=(startSnap.snapDistance+endSnap.snapDistance)/2;
-  document.getElementById("snapDistance").textContent=avgSnap.toFixed(1)+" m";
-
-  document.getElementById("algoStatus").textContent=
-    `최단경로 계산 완료 · ${result.visitedCount.toLocaleString()}개 노드를 확정한 뒤 목적지에 도달했습니다.`;
-
-  document.getElementById("animateBtn").disabled=false;
-  document.getElementById("guideTitle").textContent="최단경로 계산 완료";
-  document.getElementById("guideText").textContent="주황색 선이 실제 보행 네트워크를 따라 계산한 Dijkstra 최단경로입니다.";
+function renderRouteMetrics() {
+  if(!lastRoute)return;
+  const sm=lastRoute.shortMetrics,hm=lastRoute.shadeMetrics;
+  document.getElementById("shortDistance").textContent=sm.distance<1000?Math.round(sm.distance)+" m":(sm.distance/1000).toFixed(2)+" km";
+  document.getElementById("shortSun").textContent=`햇빛 노출 ${Math.round(sm.sun)} m · 그늘 ${Math.round(sm.shade)} m`;
+  document.getElementById("shadeDistance").textContent=hm.distance<1000?Math.round(hm.distance)+" m":(hm.distance/1000).toFixed(2)+" km";
+  document.getElementById("shadeSun").textContent=`햇빛 노출 ${Math.round(hm.sun)} m · 그늘 ${Math.round(hm.shade)} m`;
+  document.getElementById("extraDistance").textContent=(hm.distance-sm.distance>=0?"+":"")+Math.round(hm.distance-sm.distance)+" m";
+  const reduction=sm.sun>0?(1-hm.sun/sm.sun)*100:0;
+  document.getElementById("exposureReduction").textContent=Math.max(0,reduction).toFixed(1)+"%";
+  document.getElementById("shortVisited").textContent=lastRoute.shortest.visitedCount.toLocaleString()+"개";
+  document.getElementById("shadeVisited").textContent=lastRoute.shade.visitedCount.toLocaleString()+"개";
 }
 
 function orientedEdgeGeometry(edge,fromNode,toNode) {
@@ -984,11 +1173,8 @@ function orientedEdgeGeometry(edge,fromNode,toNode) {
   return edge.geometry;
 }
 
-function drawRoute(obj) {
-  routeLayer.removeAllFeatures();
-  const {g,result}=obj;
+function makeRouteFeatures(result,style,routeName) {
   const features=[];
-
   for(let i=0;i<result.edgePath.length;i++) {
     const edge=result.edgePath[i];
     const from=result.nodePath[i],to=result.nodePath[i+1];
@@ -996,11 +1182,35 @@ function drawRoute(obj) {
     const pts=geom.map(p=>new OpenLayers.Geometry.Point(p.lon,p.lat).transform(displayProjection,mapProjection));
     features.push(new OpenLayers.Feature.Vector(
       new OpenLayers.Geometry.LineString(pts),
-      {route:true},
-      {strokeColor:"#f0a51a",strokeWidth:6,strokeOpacity:.95}
+      {route:routeName,shadeFraction:edge.shadeFraction},
+      style
     ));
   }
+  return features;
+}
+
+function drawRoutes() {
+  routeLayer.removeAllFeatures();
+  if(!lastRoute)return;
+
+  const features=[];
+  if(routeView==="both"||routeView==="shortest") {
+    features.push(...makeRouteFeatures(lastRoute.shortest,{
+      strokeColor:"#f0a51a",strokeWidth:5,strokeOpacity:.95,strokeDashstyle:"dash"
+    },"shortest"));
+  }
+  if(routeView==="both"||routeView==="shade") {
+    features.push(...makeRouteFeatures(lastRoute.shade,{
+      strokeColor:"#16835a",strokeWidth:6,strokeOpacity:.96
+    },"shade"));
+  }
   routeLayer.addFeatures(features);
+}
+
+function routeForLabels() {
+  if(!lastRoute)return null;
+  if(routeView==="shortest") return {result:lastRoute.shortest,mode:"short"};
+  return {result:lastRoute.shade,mode:"shade"};
 }
 
 function renderWeightLabels() {
@@ -1008,68 +1218,70 @@ function renderWeightLabels() {
   layer.innerHTML="";
   if(!lastRoute || !document.getElementById("showWeights").checked || !map)return;
 
-  const {g,result}=lastRoute;
+  const selected=routeForLabels();
+  if(!selected)return;
+  const {result,mode}=selected;
+  const g=lastRoute.g;
   let cumulative=0;
 
   for(let i=0;i<result.nodePath.length;i++) {
-    if(i>0) cumulative+=result.edgePath[i-1].length;
-
-    // Avoid covering the map with labels; show S/G and roughly every third junction.
+    if(i>0) {
+      const e=result.edgePath[i-1];
+      cumulative+=mode==="shade"?e.shadeCost:e.distanceCost;
+    }
     if(i!==0 && i!==result.nodePath.length-1 && i%3!==0) continue;
 
-    const id=result.nodePath[i];
-    const n=g.nodes[id];
-    if(!n) continue;
-
+    const id=result.nodePath[i],n=g.nodes[id];
+    if(!n)continue;
     const ll=new OpenLayers.LonLat(n.lon,n.lat).transform(displayProjection,mapProjection);
-    const px=map.getPixelFromLonLat(ll);
-    if(!px) continue;
+    const px=map.getPixelFromLonLat(ll);if(!px)continue;
 
     const el=document.createElement("div");
-    el.className="weight-label";
+    el.className="weight-label "+mode;
     el.style.left=px.x+"px";el.style.top=px.y+"px";
-    el.textContent=(id==="S"?"S":id==="G"?"G":"node")+" · "+Math.round(cumulative)+"m";
+    const prefix=id==="S"?"S":id==="G"?"G":"node";
+    el.textContent=mode==="shade"?`${prefix} · 비용 ${Math.round(cumulative)}`:`${prefix} · ${Math.round(cumulative)}m`;
     layer.appendChild(el);
   }
 }
 
-function animateDijkstra() {
+function animateDijkstra(mode) {
   if(!lastRoute)return;
   resetAnimation();
 
-  const steps=lastRoute.result.steps;
+  const result=mode==="shade"?lastRoute.shade:lastRoute.shortest;
+  const steps=result.steps;
   const g=lastRoute.g;
   let i=0;
-
-  document.getElementById("algoStatus").textContent="Dijkstra 탐색을 처음부터 재생합니다.";
+  document.getElementById("algoStatus").textContent=mode==="shade"?"그늘우선 Dijkstra 탐색을 재생합니다.":"최단거리 Dijkstra 탐색을 재생합니다.";
 
   function tick() {
     if(i>=steps.length) {
       algorithmLayer.removeAllFeatures();
-      document.getElementById("algoStatus").textContent=
-        `탐색 완료 · 목적지까지 누적거리 ${Math.round(lastRoute.result.distance)}m`;
+      document.getElementById("algoStatus").textContent=mode==="shade"
+        ?`그늘우선 탐색 완료 · 누적 일사비용 ${Math.round(result.cost)}`
+        :`최단거리 탐색 완료 · 누적거리 ${Math.round(result.cost)}m`;
       return;
     }
 
-    const step=steps[i++];
-    const n=g.nodes[step.node];
+    const step=steps[i++],n=g.nodes[step.node];
     if(n) {
       algorithmLayer.removeAllFeatures();
       const geom=new OpenLayers.Geometry.Point(n.lon,n.lat).transform(displayProjection,mapProjection);
+      const color=mode==="shade"?"#16835a":"#d39a00";
+      const fill=mode==="shade"?"#dff5e9":"#fff0b8";
       algorithmLayer.addFeatures([new OpenLayers.Feature.Vector(
-        geom,
-        {node:step.node},
-        {
-          pointRadius:7,fillColor:"#fff0b8",strokeColor:"#d39a00",strokeWidth:2,
-          label:Math.round(step.dist)+"m",fontColor:"#17212b",fontSize:"9px",
+        geom,{node:step.node},{
+          pointRadius:7,fillColor:fill,strokeColor:color,strokeWidth:2,
+          label:Math.round(step.dist)+(mode==="shade"?"":"m"),fontColor:"#17212b",fontSize:"9px",
           labelYOffset:-14,labelOutlineColor:"#fff",labelOutlineWidth:3
         }
       )]);
     }
 
-    document.getElementById("algoStatus").textContent=
-      `확정 노드 ${step.visited.toLocaleString()}개 · 현재 최소 누적거리 ${Math.round(step.dist)}m`;
-
+    document.getElementById("algoStatus").textContent=mode==="shade"
+      ?`그늘우선 · 확정 노드 ${step.visited.toLocaleString()}개 · 현재 최소 누적비용 ${Math.round(step.dist)}`
+      :`최단거리 · 확정 노드 ${step.visited.toLocaleString()}개 · 현재 최소 누적거리 ${Math.round(step.dist)}m`;
     animationTimer=setTimeout(tick,Math.max(18,Math.min(70,3500/Math.max(1,steps.length))));
   }
   tick();
@@ -1085,11 +1297,11 @@ function clearRouteOnly() {
   resetAnimation();
   if(routeLayer) routeLayer.removeAllFeatures();
   document.getElementById("weightLayer").innerHTML="";
-  document.getElementById("routeDistance").textContent="—";
-  document.getElementById("routeNodes").textContent="—";
-  document.getElementById("visitedNodes").textContent="—";
-  document.getElementById("snapDistance").textContent="—";
-  document.getElementById("animateBtn").disabled=true;
+  ["shortDistance","shadeDistance","extraDistance","exposureReduction","shortVisited","shadeVisited"].forEach(id=>document.getElementById(id).textContent="—");
+  document.getElementById("shortSun").textContent="햇빛 노출 —";
+  document.getElementById("shadeSun").textContent="햇빛 노출 —";
+  document.getElementById("animateShortBtn").disabled=true;
+  document.getElementById("animateShadeBtn").disabled=true;
 }
 
 function syncUI() {
@@ -1103,7 +1315,7 @@ function syncUI() {
     ? `도로에 스냅 · 오차 ${endSnap.snapDistance.toFixed(1)}m`
     : networkReady?"지도에서 선택":"보행망 로딩 대기";
 
-  const ready=networkReady&&startSnap&&endSnap;
+  const ready=networkReady&&buildingReady&&startSnap&&endSnap;
   document.getElementById("routeBtn").disabled=!ready;
 
   if(!networkReady)return;
@@ -1115,7 +1327,28 @@ function syncUI() {
     document.getElementById("guideText").textContent="다른 위치를 클릭해 목적지를 지정하세요.";
   } else if(!lastRoute) {
     document.getElementById("guideTitle").textContent="S/G 임시 노드 생성 완료";
-    document.getElementById("guideText").textContent="왼쪽의 다익스트라 최단경로 계산 버튼을 누르세요.";
+    document.getElementById("guideText").textContent="왼쪽의 최단거리 + 그늘우선 계산 버튼을 누르세요.";
+  }
+}
+
+function updateShadePriority({recalculate=true}={}) {
+  const range=document.getElementById("shadePriorityRange");
+  if(!range)return;
+
+  sunPenalty=Number(range.value);
+  document.getElementById("shadePriorityLabel").textContent=sunPenalty.toFixed(1)+"×";
+
+  const formula=document.getElementById("shadeFormula");
+  if(formula) {
+    formula.textContent=
+      `그늘우선 비용 = 건물그늘거리 × 1.0 + 직사광선거리 × ${sunPenalty.toFixed(1)}`;
+  }
+
+  if(recalculate && lastRoute && startSnap && endSnap && networkReady && buildingReady) {
+    if(routeRecalcTimer) clearTimeout(routeRecalcTimer);
+    document.getElementById("algoStatus").textContent=
+      `그늘 중요도를 ${sunPenalty.toFixed(1)}×로 변경해 경로를 다시 계산합니다.`;
+    routeRecalcTimer=setTimeout(()=>calculateRoute({silent:true}),180);
   }
 }
 
@@ -1135,63 +1368,42 @@ function updateTime() {
   document.getElementById("sunState").textContent=
     `${state} · 태양 고도 ${sun.altitude.toFixed(1)}°`;
 
+  invalidateShadeAnalysis();
   updateBuildingShadows();
-}
-
-document.getElementById("startBtn").classList.toggle("active",selectMode==="start");
-  document.getElementById("endBtn").classList.toggle("active",selectMode==="end");
-
-  document.getElementById("startInfo").textContent=startSnap
-    ? `도로에 스냅 · 오차 ${startSnap.snapDistance.toFixed(1)}m`
-    : networkReady?"지도에서 선택":"보행망 로딩 대기";
-  document.getElementById("endInfo").textContent=endSnap
-    ? `도로에 스냅 · 오차 ${endSnap.snapDistance.toFixed(1)}m`
-    : networkReady?"지도에서 선택":"보행망 로딩 대기";
-
-  const ready=networkReady&&startSnap&&endSnap;
-  document.getElementById("routeBtn").disabled=!ready;
-
-  if(!networkReady)return;
-  if(!startSnap) {
-    document.getElementById("guideTitle").textContent="출발점을 선택하세요";
-    document.getElementById("guideText").textContent="지도 아무 곳을 클릭하면 실제 보행도로에 자동으로 붙습니다.";
-  } else if(!endSnap) {
-    document.getElementById("guideTitle").textContent="도착점을 선택하세요";
-    document.getElementById("guideText").textContent="다른 위치를 클릭해 목적지를 지정하세요.";
-  } else if(!lastRoute) {
-    document.getElementById("guideTitle").textContent="S/G 임시 노드 생성 완료";
-    document.getElementById("guideText").textContent="왼쪽의 다익스트라 최단경로 계산 버튼을 누르세요.";
+  if(lastRoute&&startSnap&&endSnap&&networkReady&&buildingReady) {
+    if(routeRecalcTimer)clearTimeout(routeRecalcTimer);
+    document.getElementById("algoStatus").textContent="시간대가 바뀌어 그늘우선 경로를 다시 계산합니다.";
+    routeRecalcTimer=setTimeout(()=>calculateRoute({silent:true}),320);
   }
 }
 
-function updateTime() {
-  const hour=Number(document.getElementById("timeRange").value);
-  document.getElementById("timeLabel").textContent=String(hour).padStart(2,"0")+":00";
-  let state;
-  if(hour<=12)state="남동쪽 · 태양 고도 상승";
-  else if(hour<=14)state="남쪽 · 태양 고도 매우 높음";
-  else if(hour<=16)state="남서쪽 · 태양 고도 높음";
-  else state="서쪽 · 태양 고도 낮아짐";
-  document.getElementById("sunState").textContent=state;
-}
 
 document.getElementById("startBtn").addEventListener("click",()=>{selectMode="start";syncUI();});
 document.getElementById("endBtn").addEventListener("click",()=>{selectMode="end";syncUI();});
 document.getElementById("routeBtn").addEventListener("click",calculateRoute);
-document.getElementById("animateBtn").addEventListener("click",animateDijkstra);
+document.getElementById("animateShortBtn").addEventListener("click",()=>animateDijkstra("distance"));
+document.getElementById("animateShadeBtn").addEventListener("click",()=>animateDijkstra("shade"));
+document.querySelectorAll(".route-tab").forEach(btn=>btn.addEventListener("click",()=>{
+  document.querySelectorAll(".route-tab").forEach(b=>b.classList.remove("active"));
+  btn.classList.add("active");
+  routeView=btn.dataset.route;
+  drawRoutes();
+  renderWeightLabels();
+}));
 document.getElementById("resetBtn").addEventListener("click",()=>{
   startSnap=null;endSnap=null;selectMode="start";clearRouteOnly();
   if(pointLayer){pointLayer.removeAllFeatures();addSchoolMarker();}
   syncUI();
 });
 document.getElementById("recenterBtn").addEventListener("click",recenter);
-document.getElementById("retryNetworkBtn").addEventListener("click",loadWalkingNetwork);
+document.getElementById("retryNetworkBtn").addEventListener("click",()=>loadWalkingNetwork({force:true}));
 document.getElementById("timeRange").addEventListener("input",updateTime);
+document.getElementById("shadePriorityRange").addEventListener("input",()=>updateShadePriority({recalculate:true}));
 document.getElementById("showNetwork").addEventListener("change",e=>{networkLayer.setVisibility(e.target.checked);});
-document.getElementById("showBuildings").addEventListener("change",e=>{buildingLayer.setVisibility(e.target.checked);});
-document.getElementById("showShadows").addEventListener("change",e=>{shadowLayer.setVisibility(e.target.checked);});
+document.getElementById("showBuildings").addEventListener("change",e=>{buildingLayer.setVisibility(e.target.checked);if(e.target.checked)drawBuildings();});
+document.getElementById("showShadows").addEventListener("change",e=>{shadowLayer.setVisibility(e.target.checked);if(e.target.checked)updateBuildingShadows();else shadowLayer.removeAllFeatures();});
 document.getElementById("showJunctions").addEventListener("change",drawJunctions);
 document.getElementById("showWeights").addEventListener("change",renderWeightLabels);
 
-window.addEventListener("load",()=>{updateTime();syncUI();initMap();});
+window.addEventListener("load",()=>{updateShadePriority({recalculate:false});updateTime();syncUI();initMap();});
 window.addEventListener("resize",renderWeightLabels);
